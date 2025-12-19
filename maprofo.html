@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<title>Visor de Árboles – Corta (SNIT)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Proj4 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/proj4leaflet/1.0.2/proj4leaflet.min.js"></script>
+
+<!-- CSV -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+<style>
+html, body, #map {
+  height: 100%;
+  margin: 0;
+}
+
+#panel {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 1000;
+  background: white;
+  padding: 10px;
+  border-radius: 6px;
+  box-shadow: 0 0 6px rgba(0,0,0,0.3);
+  font-family: Arial, sans-serif;
+  font-size: 13px;
+  max-width: 300px;
+}
+
+#panel hr {
+  margin: 8px 0;
+}
+
+button {
+  width: 100%;
+  padding: 6px;
+  cursor: pointer;
+}
+</style>
+</head>
+
+<body>
+
+<div id="panel">
+  <b>Filtros</b><br><br>
+
+  <label><input type="checkbox" id="chkAprobado" checked> Autorizados</label><br>
+  <label><input type="checkbox" id="chkDenegado" checked> Denegados</label><br><br>
+
+  <label>Resolución</label><br>
+  <select id="filtroResolucion" style="width:100%">
+    <option value="">Todas</option>
+  </select><br><br>
+
+  <label>Especie</label><br>
+  <select id="filtroEspecie" style="width:100%">
+    <option value="">Todas</option>
+  </select>
+
+  <hr>
+
+  <b>Estadísticas</b><br>
+  Total árboles: <span id="stTotal">0</span><br>
+  Autorizados: <span id="stAprobados">0</span><br>
+  Denegados: <span id="stDenegados">0</span><br>
+  Vol. aprobado (m³): <span id="stVolAprob">0</span><br>
+  Vol. denegado (m³): <span id="stVolDeneg">0</span>
+
+  <hr>
+
+  <button id="btnCSV">📤 Exportar CSV</button><br><br>
+  <button id="btnGeoJSON">🌍 Exportar GeoJSON</button>
+</div>
+
+<div id="map"></div>
+
+<script>
+// ================= CONFIGURACIÓN =================
+
+// ✅ Google Sheet (pestaña ARBOLES)
+const SHEET_URL =
+  "https://docs.google.com/spreadsheets/d/1RuKw8qRksrnKrVfZOEu8iKoH7h8d1ZMzFkwOztsuXCQ/gviz/tq?tqx=out:csv&sheet=ARBOLES";
+
+// ================= CRS SNIT =================
+
+proj4.defs(
+  "EPSG:5367",
+  "+proj=tmerc +lat_0=0 +lon_0=-84 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80 +units=m +no_defs"
+);
+
+const crs5367 = new L.Proj.CRS(
+  "EPSG:5367",
+  proj4.defs("EPSG:5367"),
+  {
+    resolutions: Array.from({ length: 18 }, (_, i) => 8192 / Math.pow(2, i)),
+    origin: [0, 0]
+  }
+);
+
+// ================= MAPA =================
+
+const map = L.map("map", {
+  crs: crs5367
+}).setView([500000, 1100000], 7);
+
+// Imagen aérea
+L.tileLayer(
+  "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  { attribution: "Esri" }
+).addTo(map);
+
+// ================= CAPAS SNIT =================
+
+const riosSNIT = L.tileLayer.wms(
+  "https://geos.snitcr.go.cr/geoserver/hidrografia/wms",
+  {
+    layers: "hidrografia:rio_linea",
+    format: "image/png",
+    transparent: true,
+    crs: crs5367
+  }
+).addTo(map);
+
+const areasProtegidas = L.tileLayer.wms(
+  "https://geos.snitcr.go.cr/geoserver/areas_silvestres_protegidas/wms",
+  {
+    layers: "areas_silvestres_protegidas:asp_oficial",
+    format: "image/png",
+    transparent: true,
+    crs: crs5367
+  }
+);
+
+L.control.layers(null, {
+  "Ríos SNIT": riosSNIT,
+  "Áreas protegidas": areasProtegidas
+}).addTo(map);
+
+// ================= DATOS =================
+
+let datosSheet = [];
+let capaArboles = L.layerGroup().addTo(map);
+
+// ================= FUNCIONES =================
+
+function inicializarFiltros(datos) {
+  const resoluciones = [...new Set(datos.map(d => d.resolucion).filter(Boolean))].sort();
+  const especies = [...new Set(datos.map(d => d.especie).filter(Boolean))].sort();
+
+  resoluciones.forEach(r => {
+    const o = document.createElement("option");
+    o.value = r;
+    o.textContent = r;
+    filtroResolucion.appendChild(o);
+  });
+
+  especies.forEach(e => {
+    const o = document.createElement("option");
+    o.value = e;
+    o.textContent = e;
+    filtroEspecie.appendChild(o);
+  });
+}
+
+function obtenerFiltrados() {
+  return datosSheet.filter(f => {
+    if (!f.x_5367 || !f.y_5367) return false;
+    if (f.estado === "APROBADO" && !chkAprobado.checked) return false;
+    if (f.estado === "DENEGADO" && !chkDenegado.checked) return false;
+    if (filtroResolucion.value && f.resolucion !== filtroResolucion.value) return false;
+    if (filtroEspecie.value && f.especie !== filtroEspecie.value) return false;
+    return true;
+  });
+}
+
+function actualizarEstadisticas(lista) {
+  let t = 0, a = 0, d = 0, va = 0, vd = 0;
+
+  lista.forEach(f => {
+    t++;
+    const v = Number(f.volumen_m3) || 0;
+    if (f.estado === "APROBADO") { a++; va += v; }
+    if (f.estado === "DENEGADO") { d++; vd += v; }
+  });
+
+  stTotal.textContent = t;
+  stAprobados.textContent = a;
+  stDenegados.textContent = d;
+  stVolAprob.textContent = va.toFixed(2);
+  stVolDeneg.textContent = vd.toFixed(2);
+}
+
+function aplicarFiltros() {
+  capaArboles.clearLayers();
+  const visibles = obtenerFiltrados();
+
+  visibles.forEach(f => {
+    const punto = L.circleMarker(
+      [Number(f.x_5367), Number(f.y_5367)],
+      {
+        radius: 6,
+        fillColor: f.estado === "APROBADO" ? "#2ecc71" : "#e74c3c",
+        color: "#000",
+        weight: 1,
+        fillOpacity: 0.9
+      }
+    );
+
+    const pdfUrl = f.pdf_id
+      ? `https://drive.google.com/file/d/${f.pdf_id}/view`
+      : "#";
+
+    punto.bindPopup(`
+      <b>Resolución:</b> ${f.resolucion}<br>
+      <b>Expediente:</b> ${f.expediente || ""}<br>
+      <b>Estado:</b> ${f.estado}<br>
+      <b>Especie:</b> ${f.especie}<br>
+      <b>DAP:</b> ${f.dap_cm} cm<br>
+      <b>Altura:</b> ${f.altura_m} m<br>
+      <b>Volumen:</b> ${f.volumen_m3} m³<br><br>
+      <a href="${pdfUrl}" target="_blank">📄 Ver resolución PDF</a>
+    `);
+
+    punto.addTo(capaArboles);
+  });
+
+  actualizarEstadisticas(visibles);
+}
+
+function descargar(contenido, nombre, tipo) {
+  const blob = new Blob([contenido], { type: tipo });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nombre;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ================= EVENTOS =================
+
+["chkAprobado", "chkDenegado", "filtroResolucion", "filtroEspecie"]
+  .forEach(id => document.getElementById(id).addEventListener("change", aplicarFiltros));
+
+btnCSV.onclick = () => {
+  descargar(Papa.unparse(obtenerFiltrados()), "arboles_filtrados.csv", "text/csv");
+};
+
+btnGeoJSON.onclick = () => {
+  const datos = obtenerFiltrados();
+  const geojson = {
+    type: "FeatureCollection",
+    crs: { type: "name", properties: { name: "EPSG:5367" } },
+    features: datos.map(f => ({
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: [Number(f.x_5367), Number(f.y_5367)]
+      },
+      properties: f
+    }))
+  };
+  descargar(JSON.stringify(geojson, null, 2), "arboles_filtrados.geojson", "application/json");
+};
+
+// ================= CARGA =================
+
+fetch(SHEET_URL)
+  .then(r => r.text())
+  .then(csv => {
+    datosSheet = Papa.parse(csv, { header: true }).data;
+    inicializarFiltros(datosSheet);
+    aplicarFiltros();
+  })
+  .catch(() => alert("No se pudo cargar la hoja. Verificá permisos del Sheet."));
+</script>
+
+</body>
+</html>
